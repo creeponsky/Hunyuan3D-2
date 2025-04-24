@@ -17,7 +17,7 @@ omegaconf
 tqdm
 
 # Mesh Processing
-trimesh
+trimesh>=3.23.5
 pymeshlab
 pygltflib
 xatlas
@@ -32,9 +32,14 @@ accelerate
 
 # Demo only
 gradio
-fastapi
-uvicorn
+fastapi>=0.104.0
+uvicorn>=0.23.2
 rembg
 onnxruntime
 #gevent
 #geventhttpclient
+
+pydantic>=2.4.2
+pillow>=10.0.0
+requests>=2.31.0
+# hy3dgen dependencies should be installed separately according to project instructions
