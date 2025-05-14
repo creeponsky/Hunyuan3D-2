@@ -19,6 +19,8 @@ from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, HttpUrl
 
+from renderer_utils import render_model_cover
+
 # 配置参数
 parser = argparse.ArgumentParser(description="Hunyuan3D API服务")
 parser.add_argument("--port", type=int, default=42121, help="服务器端口号")
@@ -69,6 +71,8 @@ class TaskResponse(BaseModel):
 class TaskInfoResponse(BaseModel):
     status: str  # "pending", "processing", "completed", "failed"
     obj_path: Optional[str] = None
+    obj_cover_path: Optional[str] = None
+    glb_cover_path: Optional[str] = None
     glb_path: Optional[str] = None
     execution_time: Optional[float] = None
     error: Optional[str] = None
@@ -107,6 +111,8 @@ def process_model_generation(task_data):
         output_type = task_data["output_type"]
         obj_path = task_data["obj_path"]
         glb_path = task_data["glb_path"]
+        obj_cover_path = task_data.get("obj_cover_path")
+        glb_cover_path = task_data.get("glb_cover_path")
 
         worker_id = multiprocessing.current_process()._identity[0] - 1
         gpu_id = gpu_ids[worker_id % len(gpu_ids)]
@@ -138,6 +144,14 @@ def process_model_generation(task_data):
         mesh.export(obj_path)
         result = {"obj_path": obj_path}
 
+        # 渲染OBJ模型预览图
+        if obj_cover_path:
+            print(f"Task {task_id}: Rendering OBJ preview")
+            # 使用renderer_utils中的render_model_cover函数渲染预览图
+            render_result = render_model_cover(obj_path, obj_cover_path)
+            if render_result:
+                result["obj_cover_path"] = obj_cover_path
+
         # 如果需要生成带纹理的GLB
         if output_type == "both":
             print(f"Task {task_id}: Starting texturing")
@@ -156,6 +170,14 @@ def process_model_generation(task_data):
             # 导出为GLB
             textured_mesh.export(glb_path)
             result["glb_path"] = glb_path
+
+            # 渲染GLB模型预览图
+            if glb_cover_path:
+                print(f"Task {task_id}: Rendering GLB preview")
+                # 使用renderer_utils中的render_model_cover函数渲染预览图
+                render_result = render_model_cover(glb_path, glb_cover_path)
+                if render_result:
+                    result["glb_cover_path"] = glb_cover_path
 
         end_time = time.time()
         result["status"] = "completed"
@@ -191,10 +213,14 @@ async def handle_model_task(task_id: str, image_url: str, output_type: str):
             obj_filename = f"{task_id}.obj"
             glb_filename = f"{task_id}.glb"
             image_filename = f"{task_id}.png"
+            obj_cover_filename = f"{task_id}_obj_cover.png"
+            glb_cover_filename = f"{task_id}_glb_cover.png"
 
             obj_path = str(task_dir / obj_filename)
             glb_path = str(task_dir / glb_filename)
             image_path = str(task_dir / image_filename)
+            obj_cover_path = str(task_dir / obj_cover_filename)
+            glb_cover_path = str(task_dir / glb_cover_filename)
 
             # 下载图像并保存到本地 - 这在主进程中进行是安全的
             print(f"Downloading image for task {task_id}")
@@ -213,6 +239,8 @@ async def handle_model_task(task_id: str, image_url: str, output_type: str):
                 "output_type": output_type,
                 "obj_path": obj_path,
                 "glb_path": glb_path,
+                "obj_cover_path": obj_cover_path,
+                "glb_cover_path": glb_cover_path if output_type == "both" else None,
             }
 
             # 更新任务状态
@@ -232,8 +260,11 @@ async def handle_model_task(task_id: str, image_url: str, output_type: str):
             else:
                 tasks[task_id]["status"] = "completed"
                 tasks[task_id]["obj_path"] = result.get("obj_path")
+                tasks[task_id]["obj_cover_path"] = result.get("obj_cover_path")
                 if "glb_path" in result:
                     tasks[task_id]["glb_path"] = result.get("glb_path")
+                if "glb_cover_path" in result:
+                    tasks[task_id]["glb_cover_path"] = result.get("glb_cover_path")
                 tasks[task_id]["execution_time"] = result.get("execution_time")
 
         except Exception as e:
@@ -255,7 +286,9 @@ async def generate_3d_model(request: GenerateRequest):
         "image_url": str(request.image_url),
         "created_at": datetime.now().isoformat(),
         "obj_path": None,
+        "obj_cover_path": None,
         "glb_path": None,
+        "glb_cover_path": None,
         "execution_time": None,
     }
 
@@ -277,7 +310,9 @@ async def get_task_info(task_id: str):
     task_info = {
         "status": tasks[task_id]["status"],
         "obj_path": tasks[task_id]["obj_path"],
+        "obj_cover_path": tasks[task_id]["obj_cover_path"],
         "glb_path": tasks[task_id]["glb_path"],
+        "glb_cover_path": tasks[task_id]["glb_cover_path"],
         "execution_time": tasks[task_id]["execution_time"],
         "error": tasks[task_id].get("error"),
     }
