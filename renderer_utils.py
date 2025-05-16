@@ -33,13 +33,13 @@ def render_model_cover(
     # Load the 3D model
     mesh = vedo.load(model_path)
     mesh.color("white")
-
+    vedo.settings.screenshot_transparent_background = True
     # Initialize the plotter with offscreen rendering
     plotter = vedo.Plotter(offscreen=True)
 
     # Add the mesh to the plotter
     plotter.add(mesh)
-    plotter.background("black")
+    plotter.background("transparent")
 
     # First reset camera to ensure object is centered
     plotter.reset_camera()
@@ -87,11 +87,11 @@ if __name__ == "__main__":
     print(f"Found {len(obj_files)} .obj files")
 
     # Create renders directory
-    renders_dir = "renders"
+    timestamp = time.strftime("%Y%m%d%H%M%S")
+    renders_dir = f"renders/{timestamp}"
     os.makedirs(renders_dir, exist_ok=True)
 
     # Process each .obj file
-    timestamp = time.strftime("%Y%m%d%H%M%S")
     results = []
 
     for i, obj_path in enumerate(obj_files, 1):
