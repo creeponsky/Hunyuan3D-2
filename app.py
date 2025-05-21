@@ -90,37 +90,71 @@ class TaskInfoResponse(BaseModel):
 def init_worker():
     """设置工作进程的环境变量和GPU设备，并预加载模型"""
     global worker_models
-    worker_id = multiprocessing.current_process()._identity[0] - 1
-    gpu_id = gpu_ids[worker_id % len(gpu_ids)]
-
-    os.environ.update(
-        {
-            "CUDA_VISIBLE_DEVICES": str(gpu_id),
-            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
-        }
-    )
-    print(f"Worker process {worker_id} initialized on GPU {gpu_id}")
-
-    # 预加载模型
     try:
-        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-        from hy3dgen.texgen import Hunyuan3DPaintPipeline
+        import torch
 
-        print(f"Worker {worker_id}: Loading shape generation model...")
-        worker_models["shape_pipeline"] = (
-            Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                "tencent/Hunyuan3D-2mini", subfolder="hunyuan3d-dit-v2-mini-turbo"
+        worker_id = multiprocessing.current_process()._identity[0] - 1
+
+        # 检查CUDA是否可用
+        if not torch.cuda.is_available():
+            raise RuntimeError("No CUDA devices available")
+
+        # 获取实际可用的GPU数量
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            raise RuntimeError("No CUDA devices found")
+
+        # 确保worker_id对应的GPU ID在有效范围内
+        gpu_id = gpu_ids[worker_id % len(gpu_ids)]
+        if gpu_id >= device_count:
+            print(
+                f"Warning: GPU {gpu_id} is not available (only {device_count} GPUs found). Using GPU 0 instead."
             )
+            gpu_id = 0
+
+        # 设置环境变量
+        os.environ.update(
+            {
+                "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+            }
         )
 
-        print(f"Worker {worker_id}: Loading paint pipeline model...")
-        worker_models["paint_pipeline"] = Hunyuan3DPaintPipeline.from_pretrained(
-            "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
+        # 验证GPU设置是否生效
+        if (
+            torch.cuda.current_device() != 0
+        ):  # 因为设置了CUDA_VISIBLE_DEVICES，所以当前设备应该总是0
+            raise RuntimeError(
+                f"Failed to set GPU device. Current device: {torch.cuda.current_device()}"
+            )
+
+        print(
+            f"Worker process {worker_id} initialized on GPU {gpu_id} ({torch.cuda.get_device_name(0)})"
         )
-        print(f"Worker {worker_id}: Models loaded successfully")
+
+        # 预加载模型
+        try:
+            from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+            print(f"Worker {worker_id}: Loading shape generation model...")
+            worker_models["shape_pipeline"] = (
+                Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                    "tencent/Hunyuan3D-2mini", subfolder="hunyuan3d-dit-v2-mini-turbo"
+                )
+            )
+
+            print(f"Worker {worker_id}: Loading paint pipeline model...")
+            worker_models["paint_pipeline"] = Hunyuan3DPaintPipeline.from_pretrained(
+                "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
+            )
+            print(f"Worker {worker_id}: Models loaded successfully")
+        except Exception as e:
+            print(f"Worker {worker_id}: Failed to load models: {str(e)}")
+            raise
     except Exception as e:
-        print(f"Worker {worker_id}: Failed to load models: {str(e)}")
+        print(f"Worker initialization failed: {str(e)}")
         raise
 
 
@@ -132,7 +166,6 @@ def process_model_generation(task_data):
     try:
         # 导入GPU相关模块
         import torch
-        import trimesh
         from PIL import Image
 
         from hy3dgen.rembg import BackgroundRemover
@@ -206,7 +239,7 @@ def process_model_generation(task_data):
         result = {"obj_path": obj_path}
 
         # 渲染OBJ模型预览图
-        if obj_cover_path:
+        if obj_cover_path and False:
             print(f"Task {task_id}: Rendering OBJ preview")
             render_result = render_model_cover(obj_path, obj_cover_path)
             if render_result:
@@ -217,13 +250,11 @@ def process_model_generation(task_data):
             print(f"Task {task_id}: Starting texturing")
             try:
                 # 加载生成的网格
-                trimesh_mesh = trimesh.load(obj_path)
+                trimesh_mesh = mesh
                 log_gpu_memory()
 
                 # 使用预加载的模型应用纹理
-                textured_mesh = worker_models["paint_pipeline"](
-                    trimesh_mesh, image=[image]
-                )
+                textured_mesh = worker_models["paint_pipeline"](trimesh_mesh, image)
                 log_gpu_memory()
 
                 # 导出为GLB
@@ -231,7 +262,7 @@ def process_model_generation(task_data):
                 result["glb_path"] = glb_path
 
                 # 渲染GLB模型预览图
-                if glb_cover_path:
+                if glb_cover_path and False:
                     print(f"Task {task_id}: Rendering GLB preview")
                     render_result = render_model_cover(glb_path, glb_cover_path)
                     if render_result:
@@ -448,9 +479,93 @@ async def shutdown_event():
     print("Application shutdown complete")
 
 
+def check_gpu_availability():
+    """检查GPU可用性并返回可用的GPU ID列表"""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            print("Warning: No CUDA devices available. Running in CPU mode.")
+            return []
+
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            print("Warning: No CUDA devices found.")
+            return []
+
+        available_gpus = []
+        for i in range(device_count):
+            try:
+                # 尝试在GPU上分配一些内存来验证其可用性
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+                # 分配一个小的张量来测试GPU
+                test_tensor = torch.zeros(1, device=f"cuda:{i}")
+                del test_tensor
+                torch.cuda.empty_cache()
+                available_gpus.append(i)
+                print(f"GPU {i} ({torch.cuda.get_device_name(i)}) is available")
+            except Exception as e:
+                print(f"GPU {i} is not available: {str(e)}")
+
+        return available_gpus
+    except Exception as e:
+        print(f"Error checking GPU availability: {str(e)}")
+        return []
+
+
 def main():
     """应用程序主入口点"""
-    global process_pool, task_semaphore, models_preloaded, loader_pid
+    global \
+        process_pool, \
+        task_semaphore, \
+        models_preloaded, \
+        loader_pid, \
+        gpu_ids, \
+        MAX_WORKERS
+
+    # 检查GPU可用性
+    available_gpus = check_gpu_availability()
+
+    if not available_gpus:
+        print("No available GPUs found. Please check your CUDA installation.")
+        return
+
+    # 验证并调整用户指定的GPU
+    requested_gpus = [int(gpu_id.strip()) for gpu_id in args.gpus.split(",")]
+
+    # 检查是否有超出范围的GPU ID
+    max_gpu_id = max(available_gpus)
+    invalid_gpus = [gpu for gpu in requested_gpus if gpu > max_gpu_id]
+    if invalid_gpus:
+        print(
+            f"Warning: GPU IDs {invalid_gpus} are invalid (max available GPU ID is {max_gpu_id})"
+        )
+        print(f"Available GPUs: {available_gpus}")
+        print("Using GPU 0 instead")
+        gpu_ids = [0]  # 如果指定了无效的GPU，默认使用GPU 0
+    else:
+        valid_gpus = [gpu for gpu in requested_gpus if gpu in available_gpus]
+        if not valid_gpus:
+            print(
+                f"Warning: None of the requested GPUs {requested_gpus} are available."
+            )
+            print("Using GPU 0 instead")
+            gpu_ids = [0]  # 如果所有请求的GPU都不可用，使用GPU 0
+        else:
+            if len(valid_gpus) < len(requested_gpus):
+                print("Warning: Some requested GPUs are not available.")
+                print(f"Requested GPUs: {requested_gpus}")
+                print(f"Available GPUs: {available_gpus}")
+                print(f"Using available GPUs: {valid_gpus}")
+            gpu_ids = valid_gpus
+
+    # 更新MAX_WORKERS以匹配实际可用的GPU数量
+    MAX_WORKERS = min(args.max_workers, len(gpu_ids))
+    if MAX_WORKERS < args.max_workers:
+        print(
+            f"Warning: Reducing max_workers from {args.max_workers} to {MAX_WORKERS} to match available GPUs"
+        )
 
     print("Starting Hunyuan3D API service with:")
     print(f"- Using GPUs: {gpu_ids}")

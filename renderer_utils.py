@@ -32,6 +32,9 @@ def render_model_cover(
             print(f"Warning: Could not create directory {output_dir}: {e}")
     # Load the 3D model
     mesh = vedo.load(model_path)
+    if mesh.is_empty():
+        print(f"Warning: Empty mesh loaded from {model_path}")
+        return None
     mesh.color("white")
     vedo.settings.screenshot_transparent_background = True
     # Initialize the plotter with offscreen rendering
