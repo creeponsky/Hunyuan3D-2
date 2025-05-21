@@ -12,11 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
-import trimesh
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from PIL import Image
 from pydantic import BaseModel, HttpUrl
 
 from renderer_utils import render_model_cover
@@ -53,15 +51,25 @@ task_semaphore = None
 models_preloaded = False
 loader_pid = None
 
+# 工作进程全局变量
+worker_models = {"shape_pipeline": None, "paint_pipeline": None}
+
 
 class GenerateType(str, Enum):
     only_model = "only_model"
     both = "both"
 
 
+class QualityLevel(str, Enum):
+    low = "low"  # 粗略: steps=10, resolution=64
+    medium = "medium"  # 中等: steps=30, resolution=192
+    high = "high"  # 精细: steps=50, resolution=384
+
+
 class GenerateRequest(BaseModel):
     image_url: HttpUrl
     type: GenerateType = GenerateType.both
+    quality: QualityLevel = QualityLevel.high  # 默认使用中等质量
 
 
 class TaskResponse(BaseModel):
@@ -80,7 +88,8 @@ class TaskInfoResponse(BaseModel):
 
 # 初始化工作进程
 def init_worker():
-    """设置工作进程的环境变量和GPU设备"""
+    """设置工作进程的环境变量和GPU设备，并预加载模型"""
+    global worker_models
     worker_id = multiprocessing.current_process()._identity[0] - 1
     gpu_id = gpu_ids[worker_id % len(gpu_ids)]
 
@@ -93,6 +102,27 @@ def init_worker():
     )
     print(f"Worker process {worker_id} initialized on GPU {gpu_id}")
 
+    # 预加载模型
+    try:
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+        from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+        print(f"Worker {worker_id}: Loading shape generation model...")
+        worker_models["shape_pipeline"] = (
+            Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                "tencent/Hunyuan3D-2mini", subfolder="hunyuan3d-dit-v2-mini-turbo"
+            )
+        )
+
+        print(f"Worker {worker_id}: Loading paint pipeline model...")
+        worker_models["paint_pipeline"] = Hunyuan3DPaintPipeline.from_pretrained(
+            "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
+        )
+        print(f"Worker {worker_id}: Models loaded successfully")
+    except Exception as e:
+        print(f"Worker {worker_id}: Failed to load models: {str(e)}")
+        raise
+
 
 # 在单独进程中执行的GPU处理函数
 def process_model_generation(task_data):
@@ -101,18 +131,39 @@ def process_model_generation(task_data):
     """
     try:
         # 导入GPU相关模块
+        import torch
+        import trimesh
+        from PIL import Image
+
         from hy3dgen.rembg import BackgroundRemover
-        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-        from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+        # 记录GPU内存使用情况
+        def log_gpu_memory():
+            if torch.cuda.is_available():
+                gpu_id = torch.cuda.current_device()
+                memory_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
+                memory_reserved = torch.cuda.memory_reserved(gpu_id) / 1024**2
+                print(
+                    f"GPU {gpu_id} Memory - Allocated: {memory_allocated:.2f}MB, Reserved: {memory_reserved:.2f}MB"
+                )
 
         # 解析任务数据
         task_id = task_data["task_id"]
         image_path = task_data["image_path"]
         output_type = task_data["output_type"]
+        quality = QualityLevel(task_data["quality"])
         obj_path = task_data["obj_path"]
         glb_path = task_data["glb_path"]
         obj_cover_path = task_data.get("obj_cover_path")
         glb_cover_path = task_data.get("glb_cover_path")
+
+        # 根据质量级别设置参数
+        quality_params = {
+            QualityLevel.low: {"num_inference_steps": 10, "octree_resolution": 64},
+            QualityLevel.medium: {"num_inference_steps": 30, "octree_resolution": 192},
+            QualityLevel.high: {"num_inference_steps": 50, "octree_resolution": 384},
+        }
+        params = quality_params[quality]
 
         worker_id = multiprocessing.current_process()._identity[0] - 1
         gpu_id = gpu_ids[worker_id % len(gpu_ids)]
@@ -121,24 +172,34 @@ def process_model_generation(task_data):
         print(
             f"Worker process {worker_id} (PID {current_pid}) on GPU {gpu_id}: Starting task {task_id}"
         )
+        print(f"Task parameters: quality={quality}, output_type={output_type}")
+        log_gpu_memory()
 
         start_time = time.time()
 
         # 加载图像
+        print(f"Task {task_id}: Loading image from {image_path}")
         image = Image.open(image_path)
         if image.mode == "RGB":
+            print(f"Task {task_id}: Removing background")
             rembg = BackgroundRemover()
             image = rembg(image)
+        log_gpu_memory()
 
-        # 加载形状生成模型
-        print(f"Task {task_id}: Loading shape generation model")
-        shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-            "tencent/Hunyuan3D-2"
-        )
-
-        # 生成3D网格
-        print(f"Task {task_id}: Generating shape")
-        mesh = shape_pipeline(image=image)[0]
+        # 使用预加载的模型生成3D网格
+        print(f"Task {task_id}: Generating shape with quality {quality}")
+        try:
+            mesh = worker_models["shape_pipeline"](
+                image=image,
+                num_inference_steps=params["num_inference_steps"],
+                octree_resolution=params["octree_resolution"],
+            )[0]
+            log_gpu_memory()
+        except Exception as e:
+            print(f"Task {task_id}: Error during shape generation: {str(e)}")
+            print(f"Task {task_id}: GPU memory state before error:")
+            log_gpu_memory()
+            raise
 
         # 保存OBJ文件
         mesh.export(obj_path)
@@ -147,7 +208,6 @@ def process_model_generation(task_data):
         # 渲染OBJ模型预览图
         if obj_cover_path:
             print(f"Task {task_id}: Rendering OBJ preview")
-            # 使用renderer_utils中的render_model_cover函数渲染预览图
             render_result = render_model_cover(obj_path, obj_cover_path)
             if render_result:
                 result["obj_cover_path"] = obj_cover_path
@@ -155,29 +215,32 @@ def process_model_generation(task_data):
         # 如果需要生成带纹理的GLB
         if output_type == "both":
             print(f"Task {task_id}: Starting texturing")
+            try:
+                # 加载生成的网格
+                trimesh_mesh = trimesh.load(obj_path)
+                log_gpu_memory()
 
-            # 加载纹理生成模型
-            paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-                "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
-            )
+                # 使用预加载的模型应用纹理
+                textured_mesh = worker_models["paint_pipeline"](
+                    trimesh_mesh, image=[image]
+                )
+                log_gpu_memory()
 
-            # 加载生成的网格
-            trimesh_mesh = trimesh.load(obj_path)
+                # 导出为GLB
+                textured_mesh.export(glb_path)
+                result["glb_path"] = glb_path
 
-            # 应用纹理
-            textured_mesh = paint_pipeline(trimesh_mesh, image=[image])
-
-            # 导出为GLB
-            textured_mesh.export(glb_path)
-            result["glb_path"] = glb_path
-
-            # 渲染GLB模型预览图
-            if glb_cover_path:
-                print(f"Task {task_id}: Rendering GLB preview")
-                # 使用renderer_utils中的render_model_cover函数渲染预览图
-                render_result = render_model_cover(glb_path, glb_cover_path)
-                if render_result:
-                    result["glb_cover_path"] = glb_cover_path
+                # 渲染GLB模型预览图
+                if glb_cover_path:
+                    print(f"Task {task_id}: Rendering GLB preview")
+                    render_result = render_model_cover(glb_path, glb_cover_path)
+                    if render_result:
+                        result["glb_cover_path"] = glb_cover_path
+            except Exception as e:
+                print(f"Task {task_id}: Error during texturing: {str(e)}")
+                print(f"Task {task_id}: GPU memory state before error:")
+                log_gpu_memory()
+                raise
 
         end_time = time.time()
         result["status"] = "completed"
@@ -191,10 +254,24 @@ def process_model_generation(task_data):
     except Exception as e:
         error_msg = f"Error in worker process: {str(e)}\n{traceback.format_exc()}"
         print(error_msg)
+        # 尝试记录更多系统信息
+        try:
+            import psutil
+
+            process = psutil.Process()
+            print(f"Process memory info: {process.memory_info().rss / 1024**2:.2f}MB")
+            if torch.cuda.is_available():
+                print(f"CUDA device count: {torch.cuda.device_count()}")
+                print(f"Current CUDA device: {torch.cuda.current_device()}")
+                print(f"CUDA device name: {torch.cuda.get_device_name()}")
+        except Exception as sys_info_error:
+            print(f"Failed to get system info: {str(sys_info_error)}")
         return {"status": "failed", "error": str(e)}
 
 
-async def handle_model_task(task_id: str, image_url: str, output_type: str):
+async def handle_model_task(
+    task_id: str, image_url: str, output_type: str, quality: str
+):
     """
     异步处理模型生成任务，在单独进程中执行GPU操作
     """
@@ -203,6 +280,7 @@ async def handle_model_task(task_id: str, image_url: str, output_type: str):
         try:
             # 更新任务状态
             tasks[task_id]["status"] = "downloading"
+            tasks[task_id]["quality"] = quality  # 记录质量级别
 
             # 为当前任务创建目录
             date_str = datetime.now().strftime("%Y%m%d")
@@ -237,6 +315,7 @@ async def handle_model_task(task_id: str, image_url: str, output_type: str):
                 "task_id": task_id,
                 "image_path": image_path,
                 "output_type": output_type,
+                "quality": quality,  # 添加质量参数
                 "obj_path": obj_path,
                 "glb_path": glb_path,
                 "obj_cover_path": obj_cover_path,
@@ -283,6 +362,7 @@ async def generate_3d_model(request: GenerateRequest):
     tasks[task_id] = {
         "status": "pending",
         "type": request.type,
+        "quality": request.quality,  # 记录质量级别
         "image_url": str(request.image_url),
         "created_at": datetime.now().isoformat(),
         "obj_path": None,
@@ -294,7 +374,9 @@ async def generate_3d_model(request: GenerateRequest):
 
     # 创建后台任务，但不等待其完成
     asyncio.create_task(
-        handle_model_task(task_id, str(request.image_url), request.type)
+        handle_model_task(
+            task_id, str(request.image_url), request.type, request.quality
+        )
     )
 
     return {"task_id": task_id}
