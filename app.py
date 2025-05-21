@@ -3,21 +3,20 @@ import asyncio
 import concurrent.futures
 import multiprocessing
 import os
-import time
-import traceback
 import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import aiohttp
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 
-from renderer_utils import render_model_cover
+from task_executor import QualityLevel, init_worker, process_model_generation
 
 # 配置参数
 parser = argparse.ArgumentParser(description="Hunyuan3D API服务")
@@ -25,11 +24,17 @@ parser.add_argument("--port", type=int, default=42121, help="服务器端口号"
 parser.add_argument(
     "--gpus",
     type=str,
-    default="3",
+    default="0",
     help="使用的GPU设备ID，多个设备用逗号分隔，如'0,1,2'",
 )
 parser.add_argument("--max_workers", type=int, default=3, help="最大并行处理任务数")
 parser.add_argument("--preload_models", default=True, help="启动时预加载模型")
+parser.add_argument(
+    "--paint_service_url",
+    type=str,
+    default="http://localhost:42122",
+    help="Paint服务URL",
+)
 args = parser.parse_args()
 
 # 解析GPU设备
@@ -51,25 +56,16 @@ task_semaphore = None
 models_preloaded = False
 loader_pid = None
 
-# 工作进程全局变量
-worker_models = {"shape_pipeline": None, "paint_pipeline": None}
-
 
 class GenerateType(str, Enum):
     only_model = "only_model"
     both = "both"
 
 
-class QualityLevel(str, Enum):
-    low = "low"  # 粗略: steps=10, resolution=64
-    medium = "medium"  # 中等: steps=30, resolution=192
-    high = "high"  # 精细: steps=50, resolution=384
-
-
 class GenerateRequest(BaseModel):
     image_url: HttpUrl
     type: GenerateType = GenerateType.both
-    quality: QualityLevel = QualityLevel.high  # 默认使用中等质量
+    quality: QualityLevel = QualityLevel.high  # 默认使用高质量
 
 
 class TaskResponse(BaseModel):
@@ -86,232 +82,15 @@ class TaskInfoResponse(BaseModel):
     error: Optional[str] = None
 
 
-# 初始化工作进程
-def init_worker():
-    """设置工作进程的环境变量和GPU设备，并预加载模型"""
-    global worker_models
-    try:
-        import torch
-
-        worker_id = multiprocessing.current_process()._identity[0] - 1
-
-        # 检查CUDA是否可用
-        if not torch.cuda.is_available():
-            raise RuntimeError("No CUDA devices available")
-
-        # 获取实际可用的GPU数量
-        device_count = torch.cuda.device_count()
-        if device_count == 0:
-            raise RuntimeError("No CUDA devices found")
-
-        # 确保worker_id对应的GPU ID在有效范围内
-        gpu_id = gpu_ids[worker_id % len(gpu_ids)]
-        if gpu_id >= device_count:
-            print(
-                f"Warning: GPU {gpu_id} is not available (only {device_count} GPUs found). Using GPU 0 instead."
-            )
-            gpu_id = 0
-
-        # 设置环境变量
-        os.environ.update(
-            {
-                "CUDA_VISIBLE_DEVICES": str(gpu_id),
-                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
-            }
-        )
-
-        # 验证GPU设置是否生效
-        if (
-            torch.cuda.current_device() != 0
-        ):  # 因为设置了CUDA_VISIBLE_DEVICES，所以当前设备应该总是0
-            raise RuntimeError(
-                f"Failed to set GPU device. Current device: {torch.cuda.current_device()}"
-            )
-
-        print(
-            f"Worker process {worker_id} initialized on GPU {gpu_id} ({torch.cuda.get_device_name(0)})"
-        )
-
-        # 预加载模型
-        try:
-            from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-            from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-            print(f"Worker {worker_id}: Loading shape generation model...")
-            worker_models["shape_pipeline"] = (
-                Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                    "tencent/Hunyuan3D-2mini", subfolder="hunyuan3d-dit-v2-mini-turbo"
-                )
-            )
-
-            print(f"Worker {worker_id}: Loading paint pipeline model...")
-            worker_models["paint_pipeline"] = Hunyuan3DPaintPipeline.from_pretrained(
-                "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
-            )
-            print(f"Worker {worker_id}: Models loaded successfully")
-        except Exception as e:
-            print(f"Worker {worker_id}: Failed to load models: {str(e)}")
-            raise
-    except Exception as e:
-        print(f"Worker initialization failed: {str(e)}")
-        raise
-
-
-# 在单独进程中执行的GPU处理函数
-def process_model_generation(task_data):
-    """
-    在单独进程中运行的模型生成函数
-    """
-    try:
-        # 导入GPU相关模块
-        import torch
-        from PIL import Image
-
-        from hy3dgen.rembg import BackgroundRemover
-
-        # 记录GPU内存使用情况
-        def log_gpu_memory():
-            if torch.cuda.is_available():
-                gpu_id = torch.cuda.current_device()
-                memory_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
-                memory_reserved = torch.cuda.memory_reserved(gpu_id) / 1024**2
-                print(
-                    f"GPU {gpu_id} Memory - Allocated: {memory_allocated:.2f}MB, Reserved: {memory_reserved:.2f}MB"
-                )
-
-        # 解析任务数据
-        task_id = task_data["task_id"]
-        image_path = task_data["image_path"]
-        output_type = task_data["output_type"]
-        quality = QualityLevel(task_data["quality"])
-        obj_path = task_data["obj_path"]
-        glb_path = task_data["glb_path"]
-        obj_cover_path = task_data.get("obj_cover_path")
-        glb_cover_path = task_data.get("glb_cover_path")
-
-        # 根据质量级别设置参数
-        quality_params = {
-            QualityLevel.low: {"num_inference_steps": 10, "octree_resolution": 64},
-            QualityLevel.medium: {"num_inference_steps": 30, "octree_resolution": 192},
-            QualityLevel.high: {"num_inference_steps": 50, "octree_resolution": 384},
-        }
-        params = quality_params[quality]
-
-        worker_id = multiprocessing.current_process()._identity[0] - 1
-        gpu_id = gpu_ids[worker_id % len(gpu_ids)]
-        current_pid = os.getpid()
-
-        print(
-            f"Worker process {worker_id} (PID {current_pid}) on GPU {gpu_id}: Starting task {task_id}"
-        )
-        print(f"Task parameters: quality={quality}, output_type={output_type}")
-        log_gpu_memory()
-
-        start_time = time.time()
-
-        # 加载图像
-        print(f"Task {task_id}: Loading image from {image_path}")
-        image = Image.open(image_path)
-        if image.mode == "RGB":
-            print(f"Task {task_id}: Removing background")
-            rembg = BackgroundRemover()
-            image = rembg(image)
-        log_gpu_memory()
-
-        # 使用预加载的模型生成3D网格
-        print(f"Task {task_id}: Generating shape with quality {quality}")
-        try:
-            mesh = worker_models["shape_pipeline"](
-                image=image,
-                num_inference_steps=params["num_inference_steps"],
-                octree_resolution=params["octree_resolution"],
-            )[0]
-            log_gpu_memory()
-        except Exception as e:
-            print(f"Task {task_id}: Error during shape generation: {str(e)}")
-            print(f"Task {task_id}: GPU memory state before error:")
-            log_gpu_memory()
-            raise
-
-        # 保存OBJ文件
-        mesh.export(obj_path)
-        result = {"obj_path": obj_path}
-
-        # 渲染OBJ模型预览图
-        if obj_cover_path and False:
-            print(f"Task {task_id}: Rendering OBJ preview")
-            render_result = render_model_cover(obj_path, obj_cover_path)
-            if render_result:
-                result["obj_cover_path"] = obj_cover_path
-
-        # 如果需要生成带纹理的GLB
-        if output_type == "both":
-            print(f"Task {task_id}: Starting texturing")
-            try:
-                # 加载生成的网格
-                trimesh_mesh = mesh
-                log_gpu_memory()
-
-                # 使用预加载的模型应用纹理
-                textured_mesh = worker_models["paint_pipeline"](trimesh_mesh, image)
-                log_gpu_memory()
-
-                # 导出为GLB
-                textured_mesh.export(glb_path)
-                result["glb_path"] = glb_path
-
-                # 渲染GLB模型预览图
-                if glb_cover_path and False:
-                    print(f"Task {task_id}: Rendering GLB preview")
-                    render_result = render_model_cover(glb_path, glb_cover_path)
-                    if render_result:
-                        result["glb_cover_path"] = glb_cover_path
-            except Exception as e:
-                print(f"Task {task_id}: Error during texturing: {str(e)}")
-                print(f"Task {task_id}: GPU memory state before error:")
-                log_gpu_memory()
-                raise
-
-        end_time = time.time()
-        result["status"] = "completed"
-        result["execution_time"] = end_time - start_time
-
-        print(
-            f"Task {task_id}: Completed in {end_time - start_time:.2f} seconds on GPU {gpu_id}"
-        )
-        return result
-
-    except Exception as e:
-        error_msg = f"Error in worker process: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
-        # 尝试记录更多系统信息
-        try:
-            import psutil
-
-            process = psutil.Process()
-            print(f"Process memory info: {process.memory_info().rss / 1024**2:.2f}MB")
-            if torch.cuda.is_available():
-                print(f"CUDA device count: {torch.cuda.device_count()}")
-                print(f"Current CUDA device: {torch.cuda.current_device()}")
-                print(f"CUDA device name: {torch.cuda.get_device_name()}")
-        except Exception as sys_info_error:
-            print(f"Failed to get system info: {str(sys_info_error)}")
-        return {"status": "failed", "error": str(e)}
-
-
 async def handle_model_task(
     task_id: str, image_url: str, output_type: str, quality: str
 ):
-    """
-    异步处理模型生成任务，在单独进程中执行GPU操作
-    """
-    # 使用信号量限制并发任务数
+    """异步处理模型生成任务，在单独进程中执行GPU操作"""
     async with task_semaphore:
         try:
             # 更新任务状态
             tasks[task_id]["status"] = "downloading"
-            tasks[task_id]["quality"] = quality  # 记录质量级别
+            tasks[task_id]["quality"] = quality
 
             # 为当前任务创建目录
             date_str = datetime.now().strftime("%Y%m%d")
@@ -331,52 +110,147 @@ async def handle_model_task(
             obj_cover_path = str(task_dir / obj_cover_filename)
             glb_cover_path = str(task_dir / glb_cover_filename)
 
-            # 下载图像并保存到本地 - 这在主进程中进行是安全的
+            # 下载图像
             print(f"Downloading image for task {task_id}")
             response = requests.get(image_url)
             if response.status_code != 200:
                 raise Exception(f"Failed to download image: {response.status_code}")
 
-            # 保存图像到本地文件系统
             with open(image_path, "wb") as f:
                 f.write(response.content)
 
-            # 准备发送到工作进程的任务数据
+            # 准备任务数据
             task_data = {
                 "task_id": task_id,
                 "image_path": image_path,
-                "output_type": output_type,
-                "quality": quality,  # 添加质量参数
+                "quality": quality,
                 "obj_path": obj_path,
-                "glb_path": glb_path,
                 "obj_cover_path": obj_cover_path,
-                "glb_cover_path": glb_cover_path if output_type == "both" else None,
             }
 
             # 更新任务状态
             tasks[task_id]["status"] = "processing"
 
-            # 在进程池中运行GPU密集型操作
+            # 在进程池中运行shape生成
             loop = asyncio.get_event_loop()
-            print(f"Submitting task {task_id} to process pool")
-            result = await loop.run_in_executor(
+            print(f"Submitting shape generation task {task_id}")
+            shape_result = await loop.run_in_executor(
                 process_pool, process_model_generation, task_data
             )
 
-            # 更新任务状态
-            if result.get("status") == "failed":
+            if shape_result.get("status") == "failed":
                 tasks[task_id]["status"] = "failed"
-                tasks[task_id]["error"] = result.get("error", "Unknown error")
-            else:
-                tasks[task_id]["status"] = "completed"
-                tasks[task_id]["obj_path"] = result.get("obj_path")
-                tasks[task_id]["obj_cover_path"] = result.get("obj_cover_path")
-                if "glb_path" in result:
-                    tasks[task_id]["glb_path"] = result.get("glb_path")
-                if "glb_cover_path" in result:
-                    tasks[task_id]["glb_cover_path"] = result.get("glb_cover_path")
-                tasks[task_id]["execution_time"] = result.get("execution_time")
+                tasks[task_id]["error"] = shape_result.get(
+                    "error", "Shape generation failed"
+                )
+                return
 
+            # 如果需要生成带纹理的GLB，尝试调用paint服务
+            if output_type == "both":
+                print(f"Attempting paint generation task {task_id}")
+                try:
+                    # 调用paint服务
+                    async with aiohttp.ClientSession() as session:
+                        paint_request = {
+                            "task_id": task_id,
+                            "mesh_path": obj_path,
+                            "image_path": image_path,
+                            "glb_path": glb_path,
+                            "glb_cover_path": glb_cover_path,
+                        }
+
+                        try:
+                            async with session.post(
+                                f"{args.paint_service_url}/paint",
+                                json=paint_request,
+                                timeout=300,  # 5分钟超时
+                            ) as response:
+                                if response.status == 200:
+                                    paint_result = await response.json()
+                                    if paint_result.get("status") == "completed":
+                                        # 更新GLB相关的结果
+                                        tasks[task_id].update(
+                                            {
+                                                "glb_path": paint_result.get(
+                                                    "glb_path"
+                                                ),
+                                                "glb_cover_path": paint_result.get(
+                                                    "glb_cover_path"
+                                                ),
+                                                "execution_time": (
+                                                    shape_result.get(
+                                                        "execution_time", 0
+                                                    )
+                                                    or 0
+                                                )
+                                                + (
+                                                    paint_result.get(
+                                                        "execution_time", 0
+                                                    )
+                                                    or 0
+                                                ),
+                                            }
+                                        )
+                                        tasks[task_id]["status"] = "completed"
+                                        print(
+                                            f"Task {task_id}: Paint generation completed successfully"
+                                        )
+                                    else:
+                                        tasks[task_id]["status"] = "failed"
+                                        tasks[task_id]["error"] = paint_result.get(
+                                            "error", "Paint generation failed"
+                                        )
+                                        print(
+                                            f"Task {task_id}: Paint generation failed: {paint_result.get('error')}"
+                                        )
+                                else:
+                                    error_text = await response.text()
+                                    tasks[task_id]["status"] = "failed"
+                                    tasks[task_id]["error"] = (
+                                        f"Paint service error (HTTP {response.status}): {error_text}"
+                                    )
+                                    print(
+                                        f"Task {task_id}: Paint service error (HTTP {response.status}): {error_text}"
+                                    )
+                        except asyncio.TimeoutError:
+                            tasks[task_id]["status"] = "failed"
+                            tasks[task_id]["error"] = "Paint service request timed out"
+                            print(f"Task {task_id}: Paint service request timed out")
+                        except aiohttp.ClientError as e:
+                            tasks[task_id]["status"] = "failed"
+                            tasks[task_id]["error"] = (
+                                f"Paint service connection error: {str(e)}"
+                            )
+                            print(
+                                f"Task {task_id}: Paint service connection error: {str(e)}"
+                            )
+                        except Exception as e:
+                            tasks[task_id]["status"] = "failed"
+                            tasks[task_id]["error"] = (
+                                f"Unexpected error during paint generation: {str(e)}"
+                            )
+                            print(
+                                f"Task {task_id}: Unexpected error during paint generation: {str(e)}"
+                            )
+                except Exception as e:
+                    tasks[task_id]["status"] = "failed"
+                    tasks[task_id]["error"] = (
+                        f"Failed to start paint generation: {str(e)}"
+                    )
+                    print(f"Task {task_id}: Failed to start paint generation: {str(e)}")
+            else:
+                # 如果不需要paint，直接标记任务完成
+                tasks[task_id]["status"] = "completed"
+
+            # 更新shape生成的结果
+            tasks[task_id].update(
+                {
+                    "status": "completed",
+                    "obj_path": shape_result.get("obj_path"),
+                    "obj_cover_path": shape_result.get("obj_cover_path"),
+                    "execution_time": shape_result.get("execution_time"),
+                }
+            )
         except Exception as e:
             print(f"Error in handle_model_task: {str(e)}")
             tasks[task_id]["status"] = "failed"
@@ -386,14 +260,11 @@ async def handle_model_task(
 @app.post("/generate", response_model=TaskResponse, status_code=202)
 async def generate_3d_model(request: GenerateRequest):
     """启动3D模型生成任务"""
-    # 创建任务ID
     task_id = str(uuid.uuid4())
-
-    # 初始化任务信息
     tasks[task_id] = {
         "status": "pending",
         "type": request.type,
-        "quality": request.quality,  # 记录质量级别
+        "quality": request.quality,
         "image_url": str(request.image_url),
         "created_at": datetime.now().isoformat(),
         "obj_path": None,
@@ -403,7 +274,6 @@ async def generate_3d_model(request: GenerateRequest):
         "execution_time": None,
     }
 
-    # 创建后台任务，但不等待其完成
     asyncio.create_task(
         handle_model_task(
             task_id, str(request.image_url), request.type, request.quality
@@ -415,11 +285,10 @@ async def generate_3d_model(request: GenerateRequest):
 
 @app.get("/task/{task_id}", response_model=TaskInfoResponse)
 async def get_task_info(task_id: str):
-    """获取任务状态，这个函数必须快速返回，不能阻塞"""
+    """获取任务状态"""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # 创建任务状态的副本，避免任何阻塞
     task_info = {
         "status": tasks[task_id]["status"],
         "obj_path": tasks[task_id]["obj_path"],
@@ -436,23 +305,26 @@ async def get_task_info(task_id: str):
 @app.get("/download/{file_path:path}")
 async def download_file(file_path: str):
     """下载生成的文件"""
-    # 安全检查 - 确保路径在output目录内
     full_path = Path(file_path)
-
-    # 确保路径以"output/"开头
     if not str(full_path).startswith("output/"):
         raise HTTPException(status_code=403, detail="Access denied")
-
-    # 检查文件是否存在
     if not os.path.isfile(full_path):
         raise HTTPException(status_code=404, detail="File not found")
-
     return FileResponse(path=full_path, filename=os.path.basename(full_path))
 
 
 @app.get("/status")
 async def get_status():
     """获取服务状态信息"""
+    paint_service_status = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{args.paint_service_url}/status") as response:
+                if response.status == 200:
+                    paint_service_status = await response.json()
+    except Exception as e:
+        print(f"Failed to get paint service status: {str(e)}")
+
     return {
         "gpu_ids": gpu_ids,
         "max_workers": MAX_WORKERS,
@@ -466,6 +338,7 @@ async def get_status():
             for task_id, task in tasks.items()
             if task["status"] in ["pending", "downloading", "processing"]
         ],
+        "paint_service": paint_service_status,
     }
 
 
@@ -496,10 +369,8 @@ def check_gpu_availability():
         available_gpus = []
         for i in range(device_count):
             try:
-                # 尝试在GPU上分配一些内存来验证其可用性
                 torch.cuda.set_device(i)
                 torch.cuda.empty_cache()
-                # 分配一个小的张量来测试GPU
                 test_tensor = torch.zeros(1, device=f"cuda:{i}")
                 del test_tensor
                 torch.cuda.empty_cache()
@@ -526,24 +397,22 @@ def main():
 
     # 检查GPU可用性
     available_gpus = check_gpu_availability()
-
     if not available_gpus:
         print("No available GPUs found. Please check your CUDA installation.")
         return
 
     # 验证并调整用户指定的GPU
     requested_gpus = [int(gpu_id.strip()) for gpu_id in args.gpus.split(",")]
-
-    # 检查是否有超出范围的GPU ID
     max_gpu_id = max(available_gpus)
     invalid_gpus = [gpu for gpu in requested_gpus if gpu > max_gpu_id]
+
     if invalid_gpus:
         print(
             f"Warning: GPU IDs {invalid_gpus} are invalid (max available GPU ID is {max_gpu_id})"
         )
         print(f"Available GPUs: {available_gpus}")
         print("Using GPU 0 instead")
-        gpu_ids = [0]  # 如果指定了无效的GPU，默认使用GPU 0
+        gpu_ids = [0]
     else:
         valid_gpus = [gpu for gpu in requested_gpus if gpu in available_gpus]
         if not valid_gpus:
@@ -551,7 +420,7 @@ def main():
                 f"Warning: None of the requested GPUs {requested_gpus} are available."
             )
             print("Using GPU 0 instead")
-            gpu_ids = [0]  # 如果所有请求的GPU都不可用，使用GPU 0
+            gpu_ids = [0]
         else:
             if len(valid_gpus) < len(requested_gpus):
                 print("Warning: Some requested GPUs are not available.")
@@ -560,7 +429,7 @@ def main():
                 print(f"Using available GPUs: {valid_gpus}")
             gpu_ids = valid_gpus
 
-    # 更新MAX_WORKERS以匹配实际可用的GPU数量
+    # 更新MAX_WORKERS
     MAX_WORKERS = min(args.max_workers, len(gpu_ids))
     if MAX_WORKERS < args.max_workers:
         print(
@@ -575,13 +444,13 @@ def main():
     # 创建进程池和信号量
     if __name__ == "__main__":
         multiprocessing.freeze_support()
-        # 确保在启动新进程前设置spawn方法
         multiprocessing.set_start_method("spawn", force=True)
 
     # 创建进程池
     process_pool = concurrent.futures.ProcessPoolExecutor(
         max_workers=MAX_WORKERS,
         initializer=init_worker,
+        initargs=(gpu_ids[0],),  # 使用第一个GPU初始化所有worker
     )
 
     # 信号量控制最大并行处理任务数
@@ -591,7 +460,6 @@ def main():
     try:
         uvicorn.run(app, host="0.0.0.0", port=args.port)
     finally:
-        # 确保进程池关闭
         if process_pool:
             process_pool.shutdown(wait=False)
 

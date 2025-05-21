@@ -44,3 +44,5 @@ pillow>=10.0.0
 requests>=2.31.0
 vedo
 # hy3dgen dependencies should be installed separately according to project instructions
+
+aiohttp
