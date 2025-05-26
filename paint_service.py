@@ -2,9 +2,6 @@ import argparse
 import os
 import time
 import traceback
-import uuid
-from datetime import datetime
-from pathlib import Path
 from typing import Dict, Optional
 
 import torch
@@ -78,7 +75,9 @@ def process_paint_generation(request: PaintRequest) -> Dict:
         result["status"] = "completed"
         result["execution_time"] = end_time - start_time
 
-        print(f"Task {request.task_id}: Completed in {end_time - start_time:.2f} seconds")
+        print(
+            f"Task {request.task_id}: Completed in {end_time - start_time:.2f} seconds"
+        )
         return result
 
     except Exception as e:
@@ -102,7 +101,6 @@ async def generate_texture(request: PaintRequest):
     """Generate texture for a 3D model"""
     if not model_initialized:
         raise HTTPException(status_code=503, detail="Paint service not initialized")
-    
     result = process_paint_generation(request)
     return result
 
@@ -113,7 +111,9 @@ async def get_status():
     return {
         "status": "ready" if model_initialized else "initializing",
         "gpu_id": model_manager.gpu_id if model_initialized else None,
-        "gpu_name": torch.cuda.get_device_name(0) if model_initialized and torch.cuda.is_available() else None,
+        "gpu_name": torch.cuda.get_device_name(0)
+        if model_initialized and torch.cuda.is_available()
+        else None,
     }
 
 
@@ -128,17 +128,25 @@ def main():
 
     try:
         # Set GPU environment variables before any other operations
-        os.environ.update({
-            "CUDA_VISIBLE_DEVICES": str(args.gpu),
-            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
-        })
+        os.environ.update(
+            {
+                "CUDA_VISIBLE_DEVICES": str(args.gpu),
+                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+            }
+        )
 
         # Verify GPU setting
         if torch.cuda.is_available():
-            if torch.cuda.current_device() != 0:  # Should be 0 because of CUDA_VISIBLE_DEVICES
-                raise RuntimeError(f"Failed to set GPU device. Current device: {torch.cuda.current_device()}")
-            print(f"Paint service will use GPU {args.gpu} ({torch.cuda.get_device_name(0)})")
+            if (
+                torch.cuda.current_device() != 0
+            ):  # Should be 0 because of CUDA_VISIBLE_DEVICES
+                raise RuntimeError(
+                    f"Failed to set GPU device. Current device: {torch.cuda.current_device()}"
+                )
+            print(
+                f"Paint service will use GPU {args.gpu} ({torch.cuda.get_device_name(0)})"
+            )
 
         # Initialize model
         print(f"Initializing paint service on GPU {args.gpu}")
@@ -154,4 +162,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

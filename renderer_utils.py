@@ -24,7 +24,7 @@ def render_model_cover(
         str: Path to the saved image
     """
     try:
-    # Create output directory if it doesn't exist
+        # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
             try:

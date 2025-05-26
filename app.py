@@ -29,7 +29,16 @@ parser.add_argument(
 )
 parser.add_argument("--max_workers", type=int, default=3, help="最大并行处理任务数")
 parser.add_argument("--preload_models", default=True, help="启动时预加载模型")
+<<<<<<< HEAD
 parser.add_argument("--paint_service_url", type=str, default="http://localhost:42122", help="Paint服务URL")
+=======
+parser.add_argument(
+    "--paint_service_url",
+    type=str,
+    default="http://localhost:42122",
+    help="Paint服务URL",
+)
+>>>>>>> origin/main
 args = parser.parse_args()
 
 # 解析GPU设备
@@ -135,10 +144,18 @@ async def handle_model_task(
 
             if shape_result.get("status") == "failed":
                 tasks[task_id]["status"] = "failed"
+<<<<<<< HEAD
                 tasks[task_id]["error"] = shape_result.get("error", "Shape generation failed")
                 return
 
 
+=======
+                tasks[task_id]["error"] = shape_result.get(
+                    "error", "Shape generation failed"
+                )
+                return
+
+>>>>>>> origin/main
             # 如果需要生成带纹理的GLB，尝试调用paint服务
             if output_type == "both":
                 print(f"Attempting paint generation task {task_id}")
@@ -152,17 +169,26 @@ async def handle_model_task(
                             "glb_path": glb_path,
                             "glb_cover_path": glb_cover_path,
                         }
+<<<<<<< HEAD
                         
+=======
+
+>>>>>>> origin/main
                         try:
                             async with session.post(
                                 f"{args.paint_service_url}/paint",
                                 json=paint_request,
+<<<<<<< HEAD
                                 timeout=300  # 5分钟超时
+=======
+                                timeout=300,  # 5分钟超时
+>>>>>>> origin/main
                             ) as response:
                                 if response.status == 200:
                                     paint_result = await response.json()
                                     if paint_result.get("status") == "completed":
                                         # 更新GLB相关的结果
+<<<<<<< HEAD
                                         tasks[task_id].update({
                                             "glb_path": paint_result.get("glb_path"),
                                             "glb_cover_path": paint_result.get("glb_cover_path"),
@@ -180,12 +206,58 @@ async def handle_model_task(
                                     tasks[task_id]["status"] = "failed"
                                     tasks[task_id]["error"] = f"Paint service error (HTTP {response.status}): {error_text}"
                                     print(f"Task {task_id}: Paint service error (HTTP {response.status}): {error_text}")
+=======
+                                        tasks[task_id].update(
+                                            {
+                                                "glb_path": paint_result.get(
+                                                    "glb_path"
+                                                ),
+                                                "glb_cover_path": paint_result.get(
+                                                    "glb_cover_path"
+                                                ),
+                                                "execution_time": (
+                                                    shape_result.get(
+                                                        "execution_time", 0
+                                                    )
+                                                    or 0
+                                                )
+                                                + (
+                                                    paint_result.get(
+                                                        "execution_time", 0
+                                                    )
+                                                    or 0
+                                                ),
+                                            }
+                                        )
+                                        tasks[task_id]["status"] = "completed"
+                                        print(
+                                            f"Task {task_id}: Paint generation completed successfully"
+                                        )
+                                    else:
+                                        tasks[task_id]["status"] = "failed"
+                                        tasks[task_id]["error"] = paint_result.get(
+                                            "error", "Paint generation failed"
+                                        )
+                                        print(
+                                            f"Task {task_id}: Paint generation failed: {paint_result.get('error')}"
+                                        )
+                                else:
+                                    error_text = await response.text()
+                                    tasks[task_id]["status"] = "failed"
+                                    tasks[task_id]["error"] = (
+                                        f"Paint service error (HTTP {response.status}): {error_text}"
+                                    )
+                                    print(
+                                        f"Task {task_id}: Paint service error (HTTP {response.status}): {error_text}"
+                                    )
+>>>>>>> origin/main
                         except asyncio.TimeoutError:
                             tasks[task_id]["status"] = "failed"
                             tasks[task_id]["error"] = "Paint service request timed out"
                             print(f"Task {task_id}: Paint service request timed out")
                         except aiohttp.ClientError as e:
                             tasks[task_id]["status"] = "failed"
+<<<<<<< HEAD
                             tasks[task_id]["error"] = f"Paint service connection error: {str(e)}"
                             print(f"Task {task_id}: Paint service connection error: {str(e)}")
                         except Exception as e:
@@ -195,18 +267,50 @@ async def handle_model_task(
                 except Exception as e:
                     tasks[task_id]["status"] = "failed"
                     tasks[task_id]["error"] = f"Failed to start paint generation: {str(e)}"
+=======
+                            tasks[task_id]["error"] = (
+                                f"Paint service connection error: {str(e)}"
+                            )
+                            print(
+                                f"Task {task_id}: Paint service connection error: {str(e)}"
+                            )
+                        except Exception as e:
+                            tasks[task_id]["status"] = "failed"
+                            tasks[task_id]["error"] = (
+                                f"Unexpected error during paint generation: {str(e)}"
+                            )
+                            print(
+                                f"Task {task_id}: Unexpected error during paint generation: {str(e)}"
+                            )
+                except Exception as e:
+                    tasks[task_id]["status"] = "failed"
+                    tasks[task_id]["error"] = (
+                        f"Failed to start paint generation: {str(e)}"
+                    )
+>>>>>>> origin/main
                     print(f"Task {task_id}: Failed to start paint generation: {str(e)}")
             else:
                 # 如果不需要paint，直接标记任务完成
                 tasks[task_id]["status"] = "completed"
 
             # 更新shape生成的结果
+<<<<<<< HEAD
             tasks[task_id].update({
                 "status": "completed",
                 "obj_path": shape_result.get("obj_path"),
                 "obj_cover_path": shape_result.get("obj_cover_path"),
                 "execution_time": shape_result.get("execution_time"),
             })
+=======
+            tasks[task_id].update(
+                {
+                    "status": "completed",
+                    "obj_path": shape_result.get("obj_path"),
+                    "obj_cover_path": shape_result.get("obj_cover_path"),
+                    "execution_time": shape_result.get("execution_time"),
+                }
+            )
+>>>>>>> origin/main
         except Exception as e:
             print(f"Error in handle_model_task: {str(e)}")
             tasks[task_id]["status"] = "failed"
