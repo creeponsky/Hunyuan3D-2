@@ -23,38 +23,42 @@ def render_model_cover(
     Returns:
         str: Path to the saved image
     """
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(output_path)
-    if output_dir and not os.path.exists(output_dir):
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-        except Exception as e:
-            print(f"Warning: Could not create directory {output_dir}: {e}")
-    # Load the 3D model
-    mesh = vedo.load(model_path)
-    mesh.color("white")
-    vedo.settings.screenshot_transparent_background = True
-    # Initialize the plotter with offscreen rendering
-    plotter = vedo.Plotter(offscreen=True)
-
-    # Add the mesh to the plotter
-    plotter.add(mesh)
-    plotter.background("transparent")
-
-    # First reset camera to ensure object is centered
-    plotter.reset_camera()
-
-    # Apply specified rotations
-    plotter.camera.Azimuth(azimuth)  # Rotate horizontally (around y-axis)
-    plotter.camera.Elevation(elevation)  # Rotate vertically (above x-z plane)
-    plotter.camera.Zoom(zoom)  # Adjust zoom to fit the model
-
-    # Render and capture a screenshot
     try:
-        plotter.screenshot(output_path, scale=scale).close()
-        return output_path
+    # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as e:
+                print(f"Warning: Could not create directory {output_dir}: {e}")
+        # Load the 3D model
+        mesh = vedo.load(model_path)
+        mesh.color("white")
+        vedo.settings.screenshot_transparent_background = True
+        # Initialize the plotter with offscreen rendering
+        plotter = vedo.Plotter(offscreen=True)
+
+        # Add the mesh to the plotter
+        plotter.add(mesh)
+        plotter.background("transparent")
+
+        # First reset camera to ensure object is centered
+        plotter.reset_camera()
+
+        # Apply specified rotations
+        plotter.camera.Azimuth(azimuth)  # Rotate horizontally (around y-axis)
+        plotter.camera.Elevation(elevation)  # Rotate vertically (above x-z plane)
+        plotter.camera.Zoom(zoom)  # Adjust zoom to fit the model
+
+        # Render and capture a screenshot
+        try:
+            plotter.screenshot(output_path, scale=scale).close()
+            return output_path
+        except Exception as e:
+            print(f"Error generating screenshot: {e}")
+            return None
     except Exception as e:
-        print(f"Error generating screenshot: {e}")
+        print(f"Error rendering model: {e}")
         return None
 
 
