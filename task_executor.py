@@ -41,6 +41,8 @@ def process_model_generation(task_data: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task_data["task_id"]
         image_path = task_data["image_path"]
         quality = QualityLevel(task_data["quality"])
+        num_inference_steps = task_data["num_inference_steps"]
+        octree_resolution = task_data["octree_resolution"]
         obj_path = task_data["obj_path"]
         obj_cover_path = task_data.get("obj_cover_path")
 
@@ -64,10 +66,12 @@ def process_model_generation(task_data: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Task {task_id}: Generating shape with quality {quality}")
         try:
             params = QUALITY_PARAMS[quality]
+            num_inference_steps = params["num_inference_steps"] if num_inference_steps is None else num_inference_steps
+            octree_resolution = params["octree_resolution"] if octree_resolution is None else octree_resolution
             mesh = model_manager.get_model("shape_pipeline")(
                 image=image,
-                num_inference_steps=params["num_inference_steps"],
-                octree_resolution=params["octree_resolution"],
+                num_inference_steps=num_inference_steps,
+                octree_resolution=octree_resolution,
             )[0]
             model_manager.log_gpu_memory()
         except Exception as e:

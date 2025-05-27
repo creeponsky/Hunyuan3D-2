@@ -66,7 +66,6 @@ def process_single_model(params: Dict, image_path: str, output_dir: Path) -> Dic
         obj_cover_filename = f"{task_id}_obj_cover.png"
         
         obj_path = str(task_dir / obj_filename)
-        image_path = str(task_dir / image_filename)
         obj_cover_path = str(task_dir / obj_cover_filename)
         
         # 准备任务数据
