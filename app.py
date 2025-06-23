@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 
+from cal_normals import process_model
 from task_executor import QualityLevel, init_worker, process_model_generation
 
 # 配置参数
@@ -66,6 +67,7 @@ class GenerateRequest(BaseModel):
     image_url: HttpUrl
     type: GenerateType = GenerateType.both
     quality: QualityLevel = QualityLevel.high  # 默认使用高质量
+    generate_gif: bool = True  # 默认生成GIF
 
 
 class TaskResponse(BaseModel):
@@ -78,12 +80,17 @@ class TaskInfoResponse(BaseModel):
     obj_cover_path: Optional[str] = None
     glb_cover_path: Optional[str] = None
     glb_path: Optional[str] = None
+    gif_path: Optional[str] = None  # 新增GIF路径
     execution_time: Optional[float] = None
     error: Optional[str] = None
 
 
 async def handle_model_task(
-    task_id: str, image_url: str, output_type: str, quality: str
+    task_id: str,
+    image_url: str,
+    output_type: str,
+    quality: str,
+    generate_gif: bool = True,
 ):
     """异步处理模型生成任务，在单独进程中执行GPU操作"""
     async with task_semaphore:
@@ -91,6 +98,7 @@ async def handle_model_task(
             # 更新任务状态
             tasks[task_id]["status"] = "downloading"
             tasks[task_id]["quality"] = quality
+            tasks[task_id]["generate_gif"] = generate_gif
 
             # 为当前任务创建目录
             date_str = datetime.now().strftime("%Y%m%d")
@@ -99,16 +107,20 @@ async def handle_model_task(
 
             # 生成唯一文件名
             obj_filename = f"{task_id}.obj"
+            obj_normal_filename = f"{task_id}-normal.obj"
             glb_filename = f"{task_id}.glb"
             image_filename = f"{task_id}.png"
             obj_cover_filename = f"{task_id}_obj_cover.png"
             glb_cover_filename = f"{task_id}_glb_cover.png"
+            gif_filename = f"{task_id}-normal.gif"
 
             obj_path = str(task_dir / obj_filename)
+            obj_normal_path = str(task_dir / obj_normal_filename)
             glb_path = str(task_dir / glb_filename)
             image_path = str(task_dir / image_filename)
             obj_cover_path = str(task_dir / obj_cover_filename)
             glb_cover_path = str(task_dir / glb_cover_filename)
+            gif_path = str(task_dir / gif_filename)
 
             # 下载图像
             print(f"Downloading image for task {task_id}")
@@ -145,6 +157,42 @@ async def handle_model_task(
                 )
                 return
 
+            # 处理法线和生成GIF
+            print(f"Processing normals and generating GIF for task {task_id}")
+            try:
+                gif_path_param = gif_path if generate_gif else None
+                normals_success = await loop.run_in_executor(
+                    None,
+                    process_model,
+                    obj_path,
+                    obj_normal_path,
+                    gif_path_param,
+                )
+
+                if not normals_success:
+                    print(f"Warning: Failed to process normals for task {task_id}")
+                    # 继续执行，不中断整个流程
+                else:
+                    print(f"Normals processing completed for task {task_id}")
+                    if generate_gif and os.path.exists(gif_path):
+                        print(f"GIF generated successfully for task {task_id}")
+                    elif generate_gif:
+                        print(f"Warning: GIF generation failed for task {task_id}")
+
+            except Exception as e:
+                print(f"Error processing normals for task {task_id}: {str(e)}")
+                # 继续执行，不中断整个流程
+
+            # 准备最终路径变量
+            final_obj_path = (
+                obj_normal_path
+                if os.path.exists(obj_normal_path)
+                else shape_result.get("obj_path")
+            )
+            final_gif_path = (
+                gif_path if (generate_gif and os.path.exists(gif_path)) else None
+            )
+
             # 如果需要生成带纹理的GLB，尝试调用paint服务
             if output_type == "both":
                 print(f"Attempting paint generation task {task_id}")
@@ -170,12 +218,14 @@ async def handle_model_task(
                                         # 更新GLB相关的结果
                                         tasks[task_id].update(
                                             {
+                                                "obj_path": final_obj_path,
                                                 "glb_path": paint_result.get(
                                                     "glb_path"
                                                 ),
                                                 "glb_cover_path": paint_result.get(
                                                     "glb_cover_path"
                                                 ),
+                                                "gif_path": final_gif_path,
                                                 "execution_time": (
                                                     shape_result.get(
                                                         "execution_time", 0
@@ -199,6 +249,9 @@ async def handle_model_task(
                                         tasks[task_id]["error"] = paint_result.get(
                                             "error", "Paint generation failed"
                                         )
+                                        # 即使paint失败，也要保存obj和gif路径
+                                        tasks[task_id]["obj_path"] = final_obj_path
+                                        tasks[task_id]["gif_path"] = final_gif_path
                                         print(
                                             f"Task {task_id}: Paint generation failed: {paint_result.get('error')}"
                                         )
@@ -208,18 +261,27 @@ async def handle_model_task(
                                     tasks[task_id]["error"] = (
                                         f"Paint service error (HTTP {response.status}): {error_text}"
                                     )
+                                    # 即使paint失败，也要保存obj和gif路径
+                                    tasks[task_id]["obj_path"] = final_obj_path
+                                    tasks[task_id]["gif_path"] = final_gif_path
                                     print(
                                         f"Task {task_id}: Paint service error (HTTP {response.status}): {error_text}"
                                     )
                         except asyncio.TimeoutError:
                             tasks[task_id]["status"] = "failed"
                             tasks[task_id]["error"] = "Paint service request timed out"
+                            # 即使paint失败，也要保存obj和gif路径
+                            tasks[task_id]["obj_path"] = final_obj_path
+                            tasks[task_id]["gif_path"] = final_gif_path
                             print(f"Task {task_id}: Paint service request timed out")
                         except aiohttp.ClientError as e:
                             tasks[task_id]["status"] = "failed"
                             tasks[task_id]["error"] = (
                                 f"Paint service connection error: {str(e)}"
                             )
+                            # 即使paint失败，也要保存obj和gif路径
+                            tasks[task_id]["obj_path"] = final_obj_path
+                            tasks[task_id]["gif_path"] = final_gif_path
                             print(
                                 f"Task {task_id}: Paint service connection error: {str(e)}"
                             )
@@ -228,6 +290,9 @@ async def handle_model_task(
                             tasks[task_id]["error"] = (
                                 f"Unexpected error during paint generation: {str(e)}"
                             )
+                            # 即使paint失败，也要保存obj和gif路径
+                            tasks[task_id]["obj_path"] = final_obj_path
+                            tasks[task_id]["gif_path"] = final_gif_path
                             print(
                                 f"Task {task_id}: Unexpected error during paint generation: {str(e)}"
                             )
@@ -236,17 +301,21 @@ async def handle_model_task(
                     tasks[task_id]["error"] = (
                         f"Failed to start paint generation: {str(e)}"
                     )
+                    # 即使paint失败，也要保存obj和gif路径
+                    tasks[task_id]["obj_path"] = final_obj_path
+                    tasks[task_id]["gif_path"] = final_gif_path
                     print(f"Task {task_id}: Failed to start paint generation: {str(e)}")
             else:
                 # 如果不需要paint，直接标记任务完成
                 tasks[task_id]["status"] = "completed"
 
-            # 更新shape生成的结果
+            # obj_path 更合理， 而normal obj 是用于生成gif的
             tasks[task_id].update(
                 {
                     "status": "completed",
-                    "obj_path": shape_result.get("obj_path"),
+                    "obj_path": obj_path,
                     "obj_cover_path": shape_result.get("obj_cover_path"),
+                    "gif_path": final_gif_path,
                     "execution_time": shape_result.get("execution_time"),
                 }
             )
@@ -264,18 +333,24 @@ async def generate_3d_model(request: GenerateRequest):
         "status": "pending",
         "type": request.type,
         "quality": request.quality,
+        "generate_gif": request.generate_gif,
         "image_url": str(request.image_url),
         "created_at": datetime.now().isoformat(),
         "obj_path": None,
         "obj_cover_path": None,
         "glb_path": None,
         "glb_cover_path": None,
+        "gif_path": None,
         "execution_time": None,
     }
 
     asyncio.create_task(
         handle_model_task(
-            task_id, str(request.image_url), request.type, request.quality
+            task_id,
+            str(request.image_url),
+            request.type,
+            request.quality,
+            request.generate_gif,
         )
     )
 
@@ -294,6 +369,7 @@ async def get_task_info(task_id: str):
         "obj_cover_path": tasks[task_id]["obj_cover_path"],
         "glb_path": tasks[task_id]["glb_path"],
         "glb_cover_path": tasks[task_id]["glb_cover_path"],
+        "gif_path": tasks[task_id]["gif_path"],
         "execution_time": tasks[task_id]["execution_time"],
         "error": tasks[task_id].get("error"),
     }

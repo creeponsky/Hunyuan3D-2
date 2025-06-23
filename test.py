@@ -1,23 +1,35 @@
+import os
 import time
 
-from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-from hy3dgen.texgen import Hunyuan3DPaintPipeline
+import torch
 
+from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+# 设置使用GPU 2
+torch.cuda.set_device(2)
+device = torch.device("cuda:2")
+os.environ.update(
+    {
+        "CUDA_VISIBLE_DEVICES": str(2),
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+    }
+)
 start_time = time.time()
 time1 = time.time()
 pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
     "tencent/Hunyuan3D-2mini", subfolder="hunyuan3d-dit-v2-mini-turbo"
 )
 
-input_image = "input/3.png"
-input_image2 = "input/1.png"
-mesh = pipeline(image=input_image, num_inference_steps=10, octree_resolution=64)[0]
-time2 = time.time()
-mesh2 = pipeline(image=input_image2, num_inference_steps=10, octree_resolution=64)[0]
+# input_image = "input/3.png"
+input_image2 = "assets/1.png"
+# mesh = pipeline(image=input_image, num_inference_steps=10, octree_resolution=64)[0]
+# time2 = time.time()
+mesh = pipeline(image=input_image2, num_inference_steps=10, octree_resolution=64)[0]
 time3 = time.time()
 
-print(f"第一次生成时间: {time2 - time1} 秒")
-print(f"第二次生成时间: {time3 - time2} 秒")
+# print(f"第一次生成时间: {time2 - time1} 秒")
+# print(f"第二次生成时间: {time3 - time2} 秒")
 
 # pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
 #     "tencent/Hunyuan3D-2mv", subfolder="hunyuan3d-dit-v2-mv"
@@ -35,6 +47,12 @@ print(f"Shape generation time: {end_time1 - start_time} seconds")
 print(mesh)
 
 # 导出mesh为OBJ文件
+# 计算顶点法线
+mesh.vertex_normals  # 这会自动计算平滑的顶点法线
+
+# 计算面法线
+mesh.face_normals
+
 output_path = f"output/output-{time.time()}.obj"
 mesh.export(output_path)
 print(f"Model exported to {output_path}")
@@ -56,17 +74,17 @@ print(f"Model exported to {output_path}")
 #         rembg = BackgroundRemover()
 #         image = rembg(image)
 #     images.append(image)
-end_time2 = time.time()
-print(f"Background removal time: {end_time2 - end_time1} seconds")
+# end_time2 = time.time()
+# print(f"Background removal time: {end_time2 - end_time1} seconds")
 
-texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-    "tencent/Hunyuan3D-2",
-    subfolder="hunyuan3d-paint-v2-0-turbo",
-)
+# texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
+#     "tencent/Hunyuan3D-2",
+#     subfolder="hunyuan3d-paint-v2-0-turbo",
+# )
 
-# mesh = trimesh.load("output.obj")
-end_time3 = time.time()
-print(f"Mesh loading time: {end_time3 - end_time2} seconds")
+# # mesh = trimesh.load("output.obj")
+# end_time3 = time.time()
+# print(f"Mesh loading time: {end_time3 - end_time2} seconds")
 
-mesh = texture_pipeline(mesh, image=input_image)
-mesh.export("demo_textured.obj")
+# mesh = texture_pipeline(mesh, image=input_image)
+# mesh.export("demo_textured.obj")

@@ -41,8 +41,14 @@ def process_model_generation(task_data: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task_data["task_id"]
         image_path = task_data["image_path"]
         quality = QualityLevel(task_data["quality"])
-        num_inference_steps = task_data["num_inference_steps"]
-        octree_resolution = task_data["octree_resolution"]
+        if "num_inference_steps" in task_data:
+            num_inference_steps = task_data["num_inference_steps"]
+        else:
+            num_inference_steps = QUALITY_PARAMS[quality]["num_inference_steps"]
+        if "octree_resolution" in task_data:
+            octree_resolution = task_data["octree_resolution"]
+        else:
+            octree_resolution = QUALITY_PARAMS[quality]["octree_resolution"]
         obj_path = task_data["obj_path"]
         obj_cover_path = task_data.get("obj_cover_path")
 
