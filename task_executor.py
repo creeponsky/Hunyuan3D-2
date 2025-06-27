@@ -13,8 +13,8 @@ from renderer_utils import render_model_cover
 
 
 class QualityLevel(str, Enum):
-    low = "low"  # 粗略: steps=10, resolution=64
-    medium_low = "medium_low"  # 中低: steps=20, resolution=128
+    low = "low"  # 粗略: steps=10, resolution=192
+    medium_low = "medium_low"  # 中低: steps=20, resolution=256
     medium = "medium"  # 中等: steps=30, resolution=192
     medium_high = "medium_high"  # 中高: steps=40, resolution=256
     high = "high"  # 精细: steps=50, resolution=384
@@ -22,8 +22,8 @@ class QualityLevel(str, Enum):
 
 # Quality level parameters
 QUALITY_PARAMS = {
-    QualityLevel.low: {"num_inference_steps": 10, "octree_resolution": 64},
-    QualityLevel.medium_low: {"num_inference_steps": 20, "octree_resolution": 128},
+    QualityLevel.low: {"num_inference_steps": 10, "octree_resolution": 192},
+    QualityLevel.medium_low: {"num_inference_steps": 20, "octree_resolution": 192},
     QualityLevel.medium: {"num_inference_steps": 30, "octree_resolution": 192},
     QualityLevel.medium_high: {"num_inference_steps": 40, "octree_resolution": 256},
     QualityLevel.high: {"num_inference_steps": 50, "octree_resolution": 384},
@@ -72,8 +72,16 @@ def process_model_generation(task_data: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Task {task_id}: Generating shape with quality {quality}")
         try:
             params = QUALITY_PARAMS[quality]
-            num_inference_steps = params["num_inference_steps"] if num_inference_steps is None else num_inference_steps
-            octree_resolution = params["octree_resolution"] if octree_resolution is None else octree_resolution
+            num_inference_steps = (
+                params["num_inference_steps"]
+                if num_inference_steps is None
+                else num_inference_steps
+            )
+            octree_resolution = (
+                params["octree_resolution"]
+                if octree_resolution is None
+                else octree_resolution
+            )
             mesh = model_manager.get_model("shape_pipeline")(
                 image=image,
                 num_inference_steps=num_inference_steps,
@@ -109,6 +117,7 @@ def process_model_generation(task_data: Dict[str, Any]) -> Dict[str, Any]:
         print(error_msg)
         try:
             import psutil
+
             process = psutil.Process()
             print(f"Process memory info: {process.memory_info().rss / 1024**2:.2f}MB")
             if torch.cuda.is_available():
