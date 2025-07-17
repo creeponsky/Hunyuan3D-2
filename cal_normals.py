@@ -96,7 +96,7 @@ def generate_gif(obj_path: str, gif_path: str) -> bool:
         "-h",
         "512",
         "-n",
-        "26",
+        "60",
         "-delay",
         "15",
         "-name",

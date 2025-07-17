@@ -172,5 +172,5 @@ gradio_cache/
 output/
 input/
 batchoutput/
-
+test_input/
 *.tex
